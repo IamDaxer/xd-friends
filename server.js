@@ -122,6 +122,7 @@ function makePlayerState(id, ip) {
   return {
     id,
     ip,
+    isOwner: OWNER_IP.length > 0 && ip === OWNER_IP,
     stats: getStatsForIp(ip), // referencia compartida: al mutar aquí, se mutan las stats persistentes
     x: Math.floor(Math.random() * (MAP_WIDTH - 100) + 50),
     y: Math.floor(Math.random() * (MAP_HEIGHT - 100) + 50),
@@ -271,7 +272,7 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
-  if (bannedIPs.has(clientIP)) {
+  if (bannedIPs.has(clientIP) && !isOwner) {
     const id = getIdForIp(clientIP);
     ws.send(JSON.stringify({
       type: 'BANNED',
@@ -281,6 +282,10 @@ wss.on('connection', (ws, req) => {
     }));
     ws.close();
     return;
+  }
+  // Si el owner estaba baneado (por error o por el anti-cheat), entrar limpia su propio baneo
+  if (bannedIPs.has(clientIP) && isOwner) {
+    unbanIp(clientIP);
   }
 
   const id = getIdForIp(clientIP);
@@ -379,6 +384,7 @@ wss.on('connection', (ws, req) => {
 });
 
 function checkSuspicion(ws, state) {
+  if (state.isOwner) return; // el owner nunca es baneado por el anti-cheat automático
   if (state.suspicionScore >= SUSPICION_BAN_THRESHOLD) {
     banIp(state.ip, 'Actividad anómala detectada (anti-cheat)', 'Sistema Anti-Cheat');
   }
@@ -393,6 +399,10 @@ function handleOwnerCommand(ws, data) {
     const targetIp = [...ipToId.entries()].find(([ip, idv]) => idv === targetId)?.[0];
     if (!targetIp) {
       ws.send(JSON.stringify({ type: 'OWNER_RESULT', ok: false, msg: `No se encontró el ID ${targetId}` }));
+      return;
+    }
+    if (targetIp === OWNER_IP) {
+      ws.send(JSON.stringify({ type: 'OWNER_RESULT', ok: false, msg: `No puedes banear al owner.` }));
       return;
     }
     banIp(targetIp, reason, 'Owner');
@@ -454,6 +464,7 @@ setInterval(() => {
       const pu = powerUps[i];
       if (Math.hypot(player.x - pu.x, player.y - pu.y) < PLAYER_RADIUS + POWERUP_RADIUS) {
         applyPowerUp(player, pu.type);
+        broadcastAll({ type: 'POWERUP_PICKUP', id: player.id, powerType: pu.type });
         powerUps.splice(i, 1);
       }
     }
@@ -533,3 +544,4 @@ if (!OWNER_IP) {
   console.log('[AVISO] OWNER_IP no está configurada. Nadie tendrá permisos de owner hasta que la definas como variable de entorno.');
 }
 console.log(`Servidor iniciado en el puerto ${PORT}. Máximo ${MAX_ACTIVE_PLAYERS} jugadores activos, cola hasta ${MAX_QUEUE}.`);
+
