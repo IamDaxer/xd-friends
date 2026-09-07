@@ -24,10 +24,28 @@ const MAX_QUEUE = 20; // más allá de esto, se rechaza la conexión directament
 // --- Configuración Anti-Cheat ---
 const MAX_MESSAGE_SIZE = 300;        // bytes, ningún mensaje legítimo supera esto
 const INPUT_RATE_WINDOW = 1000;      // ventana en ms
-const INPUT_RATE_MAX = 90;           // máx. mensajes INPUT/seg (mousemove/touchmove legítimos pueden ir a 60-90Hz)
-const SUSPICION_BAN_THRESHOLD = 150; // más estricto que antes
+const INPUT_RATE_MAX = 90;           // máx. mensajes INPUT/seg
+const SUSPICION_BAN_THRESHOLD = 150;
 const CONN_RATE_WINDOW = 15000;      // ventana para limitar conexiones nuevas por IP
 const CONN_RATE_MAX = 5;             // máx. intentos de conexión por IP en esa ventana
+
+// --- Power-ups ---
+const POWERUP_TYPES = ['HEALTH', 'SPEED', 'SHIELD'];
+const POWERUP_RADIUS = 14;
+const MAX_POWERUPS = 4;
+const POWERUP_SPAWN_INTERVAL = 6000;
+const HEALTH_HEAL_AMOUNT = 40;
+const SPEED_BOOST_MULT = 1.35;
+const SPEED_BOOST_DURATION = 5000;
+const SHIELD_DURATION = 5000;
+const SHIELD_DAMAGE_MULT = 0.5; // con escudo activo, recibes la mitad de daño
+
+// --- Chat ---
+const CHAT_MAX_LEN = 60;
+const CHAT_RATE_MS = 1200;
+
+// --- Marcador persistente ---
+const STATS_RESET_MS = 2 * 60 * 60 * 1000; // 2 horas
 
 function isFiniteNumber(n) {
   return typeof n === 'number' && Number.isFinite(n);
@@ -35,13 +53,10 @@ function isFiniteNumber(n) {
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
-// Normaliza IPv6-mapped IPv4 (::ffff:1.2.3.4 -> 1.2.3.4) para comparar bien
 function normalizeIP(ip) {
   if (!ip) return '';
   return ip.replace('::ffff:', '').trim();
 }
-// Render (y la mayoría de PaaS) ponen al server detrás de un proxy: la IP
-// real del cliente viaja en X-Forwarded-For, no en el socket directamente.
 function getClientIP(req) {
   const fwd = req.headers['x-forwarded-for'];
   if (fwd) return normalizeIP(fwd.split(',')[0]);
@@ -49,20 +64,29 @@ function getClientIP(req) {
 }
 
 // --- Estado global ---
-const activePlayers = new Map();   // ws -> playerState (los 10 que están jugando)
+const activePlayers = new Map();   // ws -> playerState (los que están jugando)
 const waitingQueue = [];           // [{ ws, id, ip }] en orden de llegada
 const bullets = [];
+const powerUps = [];
 const bannedIPs = new Set();
-const banReasons = new Map();      // ip -> motivo
-const banByMap = new Map();        // ip -> quién baneó ("Owner" | "Sistema Anti-Cheat")
+const banReasons = new Map();
+const banByMap = new Map();
 const ipToId = new Map();          // ip -> id estable durante la vida del proceso
 const connAttempts = new Map();    // ip -> [timestamps de intentos de conexión]
+const playerStats = new Map();     // ip -> {kills, deaths} — persiste entre reconexiones, se limpia cada 2h
 
 function getIdForIp(ip) {
   if (!ipToId.has(ip)) {
     ipToId.set(ip, Math.random().toString(36).substring(2, 7).toUpperCase());
   }
   return ipToId.get(ip);
+}
+
+function getStatsForIp(ip) {
+  if (!playerStats.has(ip)) {
+    playerStats.set(ip, { kills: 0, deaths: 0 });
+  }
+  return playerStats.get(ip);
 }
 
 function isConnRateLimited(ip) {
@@ -98,29 +122,29 @@ function makePlayerState(id, ip) {
   return {
     id,
     ip,
+    stats: getStatsForIp(ip), // referencia compartida: al mutar aquí, se mutan las stats persistentes
     x: Math.floor(Math.random() * (MAP_WIDTH - 100) + 50),
     y: Math.floor(Math.random() * (MAP_HEIGHT - 100) + 50),
     hp: 100,
     maxHp: 100,
-    kills: 0,
-    deaths: 0,
     angle: 0,
     moveX: 0,
     moveY: 0,
     isShooting: false,
     lastShootTime: 0,
     lastInputTime: Date.now(),
+    lastChatTime: 0,
     suspicionScore: 0,
     msgWindowStart: Date.now(),
-    msgCount: 0
+    msgCount: 0,
+    speedBoostUntil: 0,
+    shieldUntil: 0
   };
 }
 
-// Intenta meter a un recién llegado directo a la partida, o lo pone en cola
 function admit(record) {
   if (activePlayers.size < MAX_ACTIVE_PLAYERS) {
     const state = makePlayerState(record.id, record.ip);
-    state.ws = record.ws;
     activePlayers.set(record.ws, state);
     record.ws.send(JSON.stringify({ type: 'PROMOTED' }));
   } else {
@@ -130,17 +154,14 @@ function admit(record) {
   broadcastLobby();
 }
 
-// Cuando un jugador activo se va, sube al primero de la cola
 function promoteNextInQueue() {
   if (activePlayers.size >= MAX_ACTIVE_PLAYERS) return;
   const next = waitingQueue.shift();
   if (!next) return;
-  if (next.ws.readyState !== 1) { promoteNextInQueue(); return; } // ya se desconectó, sigue con el siguiente
+  if (next.ws.readyState !== 1) { promoteNextInQueue(); return; }
   const state = makePlayerState(next.id, next.ip);
-  state.ws = next.ws;
   activePlayers.set(next.ws, state);
   next.ws.send(JSON.stringify({ type: 'PROMOTED' }));
-  // Actualiza posición en cola de los que quedan
   waitingQueue.forEach((r, idx) => {
     r.ws.send(JSON.stringify({ type: 'WAITING', position: idx + 1 }));
   });
@@ -163,7 +184,6 @@ function removeConnection(ws) {
   broadcastLobby();
 }
 
-// Banea una IP: cierra sus conexiones activas/en cola, anuncia el motivo y quién baneó
 function banIp(ip, reason, by) {
   bannedIPs.add(ip);
   banReasons.set(ip, reason);
@@ -198,6 +218,30 @@ function unbanIp(ip) {
   broadcastAnnounce(`✅ Jugador ${id} fue desbaneado por Owner.`);
 }
 
+// --- Power-ups ---
+function spawnPowerUp() {
+  if (powerUps.length >= MAX_POWERUPS) return;
+  const type = POWERUP_TYPES[Math.floor(Math.random() * POWERUP_TYPES.length)];
+  powerUps.push({
+    id: Math.random().toString(36).substring(2, 8),
+    type,
+    x: Math.floor(Math.random() * (MAP_WIDTH - 80) + 40),
+    y: Math.floor(Math.random() * (MAP_HEIGHT - 80) + 40)
+  });
+}
+setInterval(spawnPowerUp, POWERUP_SPAWN_INTERVAL);
+
+function applyPowerUp(player, type) {
+  const now = Date.now();
+  if (type === 'HEALTH') {
+    player.hp = Math.min(player.maxHp, player.hp + HEALTH_HEAL_AMOUNT);
+  } else if (type === 'SPEED') {
+    player.speedBoostUntil = now + SPEED_BOOST_DURATION;
+  } else if (type === 'SHIELD') {
+    player.shieldUntil = now + SHIELD_DURATION;
+  }
+}
+
 // Consola local del servidor sigue disponible como respaldo de emergencia
 process.stdin.on('data', (data) => {
   if (data.toString().trim().toLowerCase() === 'unban') {
@@ -206,24 +250,27 @@ process.stdin.on('data', (data) => {
   }
 });
 
+// Reinicio del marcador cada 2 horas
+setInterval(() => {
+  playerStats.clear();
+  broadcastAnnounce('🔄 El marcador se reinició (ciclo de 2 horas).');
+}, STATS_RESET_MS);
+
 wss.on('connection', (ws, req) => {
   const clientIP = getClientIP(req);
   const isOwner = OWNER_IP.length > 0 && clientIP === OWNER_IP;
 
-  // --- Capa 1: tope duro de conexiones totales (protege contra floods de miles de sockets) ---
   if (activePlayers.size + waitingQueue.length >= MAX_ACTIVE_PLAYERS + MAX_QUEUE && !isOwner) {
     ws.send(JSON.stringify({ type: 'REJECTED', reason: 'Servidor lleno. Intenta más tarde.' }));
     ws.close();
     return;
   }
 
-  // --- Capa 2: rate-limit de conexiones nuevas por IP ---
   if (!isOwner && isConnRateLimited(clientIP)) {
     ws.close();
     return;
   }
 
-  // --- Capa 3: IP baneada ---
   if (bannedIPs.has(clientIP)) {
     const id = getIdForIp(clientIP);
     ws.send(JSON.stringify({
@@ -259,9 +306,8 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // --- Comandos de Owner: se verifica la IP en CADA mensaje, nunca se confía en el cliente ---
     if (data.type === 'OWNER_CMD') {
-      if (!isOwner) return; // se ignora en silencio, no delata nada
+      if (!isOwner) return;
       handleOwnerCommand(ws, data);
       return;
     }
@@ -276,7 +322,18 @@ wss.on('connection', (ws, req) => {
     if (bannedIPs.has(clientIP)) return;
 
     const state = activePlayers.get(ws);
-    if (!state) return; // sigue en cola, sus INPUT no cuentan hasta que juegue
+    if (!state) return; // sigue en cola
+
+    if (data.type === 'CHAT') {
+      const now = Date.now();
+      if (now - state.lastChatTime < CHAT_RATE_MS) return;
+      if (typeof data.text !== 'string') return;
+      const text = data.text.slice(0, CHAT_MAX_LEN).replace(/[\r\n]/g, ' ').trim();
+      if (!text) return;
+      state.lastChatTime = now;
+      broadcastAll({ type: 'CHAT_MSG', id: state.id, text });
+      return;
+    }
 
     if (data.type === 'INPUT') {
       const now = Date.now();
@@ -333,7 +390,7 @@ function handleOwnerCommand(ws, data) {
 
   if (action === 'BAN') {
     const reason = String(data.reason || 'Sin motivo especificado').slice(0, 100) || 'Sin motivo especificado';
-    const targetIp = [...ipToId.entries()].find(([ip, id]) => id === targetId)?.[0];
+    const targetIp = [...ipToId.entries()].find(([ip, idv]) => idv === targetId)?.[0];
     if (!targetIp) {
       ws.send(JSON.stringify({ type: 'OWNER_RESULT', ok: false, msg: `No se encontró el ID ${targetId}` }));
       return;
@@ -341,7 +398,7 @@ function handleOwnerCommand(ws, data) {
     banIp(targetIp, reason, 'Owner');
     ws.send(JSON.stringify({ type: 'OWNER_RESULT', ok: true, msg: `Baneado: ${targetId}` }));
   } else if (action === 'UNBAN') {
-    const targetIp = [...ipToId.entries()].find(([ip, id]) => id === targetId)?.[0];
+    const targetIp = [...ipToId.entries()].find(([ip, idv]) => idv === targetId)?.[0];
     if (!targetIp || !bannedIPs.has(targetIp)) {
       ws.send(JSON.stringify({ type: 'OWNER_RESULT', ok: false, msg: `${targetId} no está baneado` }));
       return;
@@ -351,27 +408,29 @@ function handleOwnerCommand(ws, data) {
   }
 }
 
-// Bucle de decaimiento de sospecha (solo aplica a jugadores activos)
+// Bucle de decaimiento de sospecha
 setInterval(() => {
   activePlayers.forEach((p) => {
     if (p.suspicionScore > 0) p.suspicionScore = Math.max(0, p.suspicionScore - 30);
   });
 }, 500);
 
-// Bucle de física (60 FPS) — solo recorre a los jugadores activos, nunca a la cola
+// Bucle de física (60 FPS)
 setInterval(() => {
   const now = Date.now();
 
   activePlayers.forEach((player) => {
     if (player.hp <= 0) return;
 
-    let dx = player.moveX * PLAYER_SPEED;
-    let dy = player.moveY * PLAYER_SPEED;
+    const effectiveSpeed = (player.speedBoostUntil > now) ? PLAYER_SPEED * SPEED_BOOST_MULT : PLAYER_SPEED;
+
+    let dx = player.moveX * effectiveSpeed;
+    let dy = player.moveY * effectiveSpeed;
 
     const mag = Math.hypot(dx, dy);
-    if (mag > PLAYER_SPEED) {
-      dx = (dx / mag) * PLAYER_SPEED;
-      dy = (dy / mag) * PLAYER_SPEED;
+    if (mag > effectiveSpeed) {
+      dx = (dx / mag) * effectiveSpeed;
+      dy = (dy / mag) * effectiveSpeed;
     }
 
     player.x = Math.max(PLAYER_RADIUS, Math.min(MAP_WIDTH - PLAYER_RADIUS, player.x + dx));
@@ -388,6 +447,15 @@ setInterval(() => {
         vy: Math.sin(player.angle) * BULLET_SPEED,
         life: 70
       });
+    }
+
+    // Recoger power-ups
+    for (let i = powerUps.length - 1; i >= 0; i--) {
+      const pu = powerUps[i];
+      if (Math.hypot(player.x - pu.x, player.y - pu.y) < PLAYER_RADIUS + POWERUP_RADIUS) {
+        applyPowerUp(player, pu.type);
+        powerUps.splice(i, 1);
+      }
     }
   });
 
@@ -408,17 +476,23 @@ setInterval(() => {
 
       if (targetPlayer.id !== b.ownerId && targetPlayer.hp > 0) {
         if (Math.hypot(targetPlayer.x - b.x, targetPlayer.y - b.y) < PLAYER_RADIUS + BULLET_RADIUS) {
-          targetPlayer.hp -= BULLET_DAMAGE;
+          let damage = BULLET_DAMAGE;
+          if (targetPlayer.shieldUntil > now) damage *= SHIELD_DAMAGE_MULT;
+          targetPlayer.hp -= damage;
           hit = true;
 
           if (targetPlayer.hp <= 0) {
             targetPlayer.hp = 0;
-            targetPlayer.deaths++;
+            targetPlayer.stats.deaths++;
             const shooter = Array.from(activePlayers.values()).find(p => p.id === b.ownerId);
-            if (shooter) shooter.kills++;
+            if (shooter) shooter.stats.kills++;
+
+            broadcastAll({ type: 'KILL', killerId: b.ownerId, victimId: targetPlayer.id });
 
             setTimeout(() => {
               targetPlayer.hp = targetPlayer.maxHp;
+              targetPlayer.speedBoostUntil = 0;
+              targetPlayer.shieldUntil = 0;
               targetPlayer.x = Math.floor(Math.random() * (MAP_WIDTH - 100) + 50);
               targetPlayer.y = Math.floor(Math.random() * (MAP_HEIGHT - 100) + 50);
             }, 2500);
@@ -442,11 +516,14 @@ setInterval(() => {
           y: p.y,
           hp: p.hp,
           maxHp: p.maxHp,
-          kills: p.kills,
-          deaths: p.deaths,
-          angle: p.angle
+          kills: p.stats.kills,
+          deaths: p.stats.deaths,
+          angle: p.angle,
+          hasShield: p.shieldUntil > now,
+          hasSpeed: p.speedBoostUntil > now
         })),
-        bullets: bullets.map(b => ({ x: b.x, y: b.y }))
+        bullets: bullets.map(b => ({ x: b.x, y: b.y })),
+        powerUps: powerUps.map(pu => ({ id: pu.id, type: pu.type, x: pu.x, y: pu.y }))
       }));
     }
   });
